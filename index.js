@@ -179,7 +179,7 @@ async function handleAxios429(fn) {
       return result;
     } catch (err) {
       if (err.response?.status === 429) {
-        const wait = randomDelay(30000, 50000);
+        const wait = randomDelay(30000, 100000);
         logWarn(`429 => waiting ${wait/1000}s...`);
         await new Promise(r => setTimeout(r, wait));
         // then continue
@@ -193,7 +193,7 @@ async function handleAxios429(fn) {
 /* ==========================
    12) getAccountID (indefinite)
    ========================== */
-async function getAccountID(token, index, delayMs = 60000) {
+async function getAccountID(token, index, delayMs = 100000) {
   let attempt = 1;
   while (true) {
     try {
@@ -219,7 +219,7 @@ async function getAccountID(token, index, delayMs = 60000) {
 /* ==========================
    13) getAccountDetails (3 attempts)
    ========================== */
-async function getAccountDetails(token, index, retries = 3, delayMs = 60000) {
+async function getAccountDetails(token, index, retries = 3, delayMs = 43200000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const agent = buildProxyAgent(index);
@@ -263,7 +263,7 @@ async function getAccountDetails(token, index, retries = 3, delayMs = 60000) {
 /* ==========================
    14) checkAndClaimReward (3 attempts)
    ========================== */
-async function checkAndClaimReward(token, index, retries = 3, delayMs = 60000) {
+async function checkAndClaimReward(token, index, retries = 3, delayMs = 43200000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const agent = buildProxyAgent(index);
