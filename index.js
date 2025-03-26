@@ -340,8 +340,8 @@ async function sendHeartbeat(token, workerID, ownerAddress, sessionID, index) {
         family: 4
       }
     );
-    // Use default of 180 seconds if next_heartbeat is undefined.
-    const nextHeartbeat = (response.data && response.data.data && response.data.data.next_heartbeat) || 180;
+
+    const nextHeartbeat = (response.data && response.data.data && response.data.data.next_heartbeat) || 300;
     logger.success(colors.green + `[${index + 1}] => Heartbeat successful. Next heartbeat in ${nextHeartbeat} seconds.` + colors.reset);
   } catch (error) {
     logger.error(colors.error + `[${index + 1}] => Error sending heartbeat: ${error.response?.data || error.message}` + colors.reset);
