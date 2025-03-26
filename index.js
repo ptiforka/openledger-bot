@@ -1,12 +1,15 @@
 /***************************************************
  * index.js
+ * Combined solution for heartbeats and reward claims
+ * using API v2 (with version, user, claim details, and
+ * streak info checks). WebSocket connection removed.
  ***************************************************/
-const fs = require('fs');
-const WebSocket = require('ws');
-const axios = require('axios');
-const https = require('https');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { v4: uuidv4 } = require('uuid');
+
+const fs = require("fs");
+const axios = require("axios");
+const https = require("https");
+const { HttpsProxyAgent } = require("https-proxy-agent");
+const { v4: uuidv4 } = require("uuid");
 
 /* ==========================
    1) Disable TLS checks (optional/insecure)
@@ -14,122 +17,86 @@ const { v4: uuidv4 } = require('uuid');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 /* ==========================
-   2) Color-coded logs
+   2) Constants, Colors, Logger, and Utils
    ========================== */
-const color = {
-  red: (txt) => `\x1b[31m${txt}\x1b[0m`,
-  green: (txt) => `\x1b[32m${txt}\x1b[0m`,
-  yellow: (txt) => `\x1b[33m${txt}\x1b[0m`,
-  cyan: (txt) => `\x1b[36m${txt}\x1b[0m`,
+const BASE_URL = "https://apitn.openledger.xyz";
+const REWARDS_URL = "https://rewardstn.openledger.xyz";
+const HEADERS = {
+  "Content-Type": "application/json"
 };
 
-function logInfo(msg) {
-  console.log(color.cyan(msg));
+const colors = {
+  info: "\x1b[36m",         // cyan
+  green: "\x1b[32m",        // green
+  error: "\x1b[31m",        // red
+  warning: "\x1b[33m",      // yellow
+  reset: "\x1b[0m"
+};
+
+const logger = {
+  info: (msg) => console.log(msg),
+  success: (msg) => console.log(msg),
+  warn: (msg) => console.log(msg),
+  error: (msg) => console.error(msg)
+};
+
+function printDivider() {
+  console.log(colors.info + "────────────────────────────────────────" + colors.reset);
 }
-function logSuccess(msg) {
-  console.log(color.green(msg));
-}
-function logWarn(msg) {
-  console.log(color.yellow(msg));
-}
-function logError(msg) {
-  console.error(color.red(msg));
+
+function formatTime(timestamp) {
+  return new Date(timestamp).toLocaleString();
 }
 
 /* ==========================
-   3) Show header
-   ========================== */
-function displayHeader() {
-  const width = process.stdout.columns || 80;
-  const lines = [
-    "<|============================================|>",
-    " OpenLedger Bot by LazyNode ",
-    " https://lazynode.com ",
-    "<|============================================|>"
-  ];
-  lines.forEach(line => {
-    const padded = line.padStart((width + line.length) / 2);
-    console.log(color.cyan(padded));
-  });
-}
-
-/* ==========================
-   4) Random Delay Helper
-   ========================== */
-function randomDelay(minMs, maxMs) {
-  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-}
-
-/* ==========================
-   5) Base64 for workerID
-   ========================== */
-function base64Encode(str) {
-  return Buffer.from(str, 'utf-8').toString('base64');
-}
-
-/* ==========================
-   6) Sanitize Proxy URL
-   ========================== */
-function sanitizeProxyUrl(raw) {
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (!/^https?:\/\//i.test(trimmed)) {
-    // If missing protocol, prepend http://
-    return 'http://' + trimmed;
-  }
-  return trimmed;
-}
-
-/* ==========================
-   7) Read account.txt
+   3) Read account.txt
    Format: ownerAddress:token
    ========================== */
-const accountLines = fs.readFileSync('account.txt', 'utf8').trim().split(/\s+/);
+const accountLines = fs.readFileSync("account.txt", "utf8").trim().split(/\s+/);
 const tokens = accountLines.map((line, idx) => {
-  const parts = line.split(':');
+  const parts = line.split(":");
   if (parts.length !== 2) {
-    logWarn(`Skipping malformed line #${idx+1}: ${line}`);
+    logger.warn(colors.warning + `Skipping malformed line #${idx + 1}: ${line}` + colors.reset);
     return null;
   }
-  const [ownerAddress, token] = parts.map(x => x.trim());
+  const [ownerAddress, token] = parts.map((x) => x.trim());
   const workerID = base64Encode(ownerAddress);
   const sessionID = uuidv4();
   return { ownerAddress, token, workerID, sessionID };
 }).filter(Boolean);
 
 if (!tokens.length) {
-  logError('No valid lines in account.txt (need "ownerAddress:token").');
+  logger.error(colors.error + 'No valid lines in account.txt (need "ownerAddress:token").' + colors.reset);
   process.exit(1);
 }
 
 /* ==========================
-   8) Read proxies
-   Must have enough lines for each token
+   4) Read proxies (one per token)
    ========================== */
 let rawProxies = [];
 try {
-  rawProxies = fs.readFileSync('proxy.txt', 'utf8').trim().split(/\s+/);
+  rawProxies = fs.readFileSync("proxy.txt", "utf8").trim().split(/\s+/);
 } catch (err) {
-  logError(`Error reading proxy.txt: ${err.message}`);
+  logger.error(colors.error + `Error reading proxy.txt: ${err.message}` + colors.reset);
   process.exit(1);
 }
 const proxies = rawProxies.map(sanitizeProxyUrl).filter(Boolean);
 if (proxies.length < tokens.length) {
-  logError('Not enough proxies for number of tokens. Provide more or do round-robin logic.');
+  logger.error(colors.error + "Not enough proxies for number of tokens. Provide more or do round-robin logic." + colors.reset);
   process.exit(1);
 }
 
 /* ==========================
-   9) GPU + data assignments
-   data.json => { [workerID]: { gpu, storage } }
+   5) GPU + Data Assignments
+   src/gpu.json should be an array of GPU names.
+   data.json persists assignments.
    ========================== */
-const gpuList = JSON.parse(fs.readFileSync('src/gpu.json', 'utf8'));
+const gpuList = JSON.parse(fs.readFileSync("src/gpu.json", "utf8"));
 let dataAssignments = {};
 try {
-  dataAssignments = JSON.parse(fs.readFileSync('data.json', 'utf8'));
+  dataAssignments = JSON.parse(fs.readFileSync("data.json", "utf8"));
 } catch {
-  logInfo('No existing data.json, starting fresh.');
+  logger.info(colors.info + "No existing data.json, starting fresh." + colors.reset);
 }
 
 function getOrAssignResources(workerID) {
@@ -138,51 +105,56 @@ function getOrAssignResources(workerID) {
     const randomStorage = (Math.random() * 500).toFixed(2);
     dataAssignments[workerID] = { gpu: randomGPU, storage: randomStorage };
     try {
-      fs.writeFileSync('data.json', JSON.stringify(dataAssignments, null, 2));
+      fs.writeFileSync("data.json", JSON.stringify(dataAssignments, null, 2));
     } catch (err) {
-      logError(`Error writing data.json: ${err.message}`);
+      logger.error(colors.error + `Error writing data.json: ${err.message}` + colors.reset);
     }
   }
   return dataAssignments[workerID];
 }
 
 /* ==========================
-   10) Shared State
-   We'll store token => accountID
-   Force always proxy = true
+   6) Shared State
    ========================== */
 const accountIDs = {};
 const useProxy = true;
 
-/* 
-   Helper: build an agent (Axios or WebSocket) from the i-th proxy
-   We also set rejectUnauthorized=false if ignoring cert errors
-*/
+/* ==========================
+   7) Helper Functions
+   ========================== */
+function base64Encode(str) {
+  return Buffer.from(str, "utf-8").toString("base64");
+}
+
+function sanitizeProxyUrl(raw) {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return "http://" + trimmed;
+  }
+  return trimmed;
+}
+
 function buildProxyAgent(index) {
   const proxyUrl = useProxy ? proxies[index] : null;
   if (!proxyUrl) {
-    // fallback
     return new https.Agent({ rejectUnauthorized: false });
   }
   return new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false });
 }
 
-/* ==========================
-   11) 429 Retry Logic in HTTP
-   ========================== */
 async function handleAxios429(fn) {
-  // We'll wrap each call in a try/catch that if 429 => random 30-50s wait
   let result;
   while (true) {
     try {
       result = await fn();
       return result;
     } catch (err) {
-      if (err.response?.status === 429) {
+      if (err.response && err.response.status === 429) {
         const wait = randomDelay(30000, 100000);
-        logWarn(`429 => waiting ${wait/1000}s...`);
-        await new Promise(r => setTimeout(r, wait));
-        // then continue
+        logger.warn(colors.warning + `429 received. Waiting ${wait / 1000}s...` + colors.reset);
+        await new Promise((r) => setTimeout(r, wait));
       } else {
         throw err;
       }
@@ -191,265 +163,242 @@ async function handleAxios429(fn) {
 }
 
 /* ==========================
-   12) getAccountID (indefinite)
+   8) API Utility Functions (v2)
    ========================== */
-async function getAccountID(token, index, delayMs = 100000) {
-  let attempt = 1;
-  while (true) {
-    try {
-      const agent = buildProxyAgent(index);
-      const resp = await handleAxios429(() => {
-        return axios.get('https://apitn.openledger.xyz/api/v1/users/me', {
-          headers: { Authorization: `Bearer ${token}` },
-          httpsAgent: agent
-        });
-      });
-      accountIDs[token] = resp.data.data.id;
-      logSuccess(`[${index + 1}] => AID=${accountIDs[token]}, Proxy=${proxies[index]}`);
-      return;
-    } catch (err) {
-      logError(`[${index + 1}] => getAccountID attempt ${attempt}: ${err.message}`);
-      logInfo(`[${index + 1}] => Retry in ${delayMs/1000}s...`);
-      await new Promise(r => setTimeout(r, delayMs));
-      attempt++;
+async function checkAppVersion(token) {
+  try {
+    const authToken = token.startsWith("Bearer") ? token : `Bearer ${token}`;
+    const response = await axios.get(`${BASE_URL}/ext/api/v2/auth/app_version`, {
+      params: { platform: "extension" },
+      headers: {
+        ...HEADERS,
+        Authorization: authToken,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "none"
+      },
+      timeout: 30000,
+      family: 4
+    });
+    logger.info(colors.info + "[VERSION CHECK]" + colors.reset);
+    logger.info(`${colors.info}▸ Platform   : ${colors.green}${response.data.platform}${colors.reset}`);
+    logger.info(`${colors.info}▸ Version    : ${colors.green}${response.data.version}${colors.reset}`);
+    logger.info(`${colors.info}▸ Status     : ${colors.green}${response.data.under_maintenance ? "Under Maintenance" : "Online"}${colors.reset}`);
+    printDivider();
+    return response.data;
+  } catch (error) {
+    logger.error(colors.error + `Failed to check app version: ${error.response?.data || error.message}` + colors.reset);
+    return null;
+  }
+}
+
+async function getUserInfo(token) {
+  try {
+    const authToken = token.startsWith("Bearer") ? token : `Bearer ${token}`;
+    const response = await axios.get(`${BASE_URL}/ext/api/v2/users/me`, {
+      headers: { ...HEADERS, Authorization: authToken },
+      timeout: 30000,
+      family: 4
+    });
+    printDivider();
+    logger.info(colors.info + "[USER INFO]" + colors.reset);
+    logger.info(`${colors.info}▸ Address    : ${colors.green}${response.data.data.address}${colors.reset}`);
+    logger.info(`${colors.info}▸ ID         : ${colors.green}${response.data.data.id}${colors.reset}`);
+    logger.info(`${colors.info}▸ Referral   : ${colors.green}${response.data.data.referral_code}${colors.reset}`);
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      logger.error(colors.error + `Failed to get user info: ${error.response.status} - ${JSON.stringify(error.response.data)}` + colors.reset);
+    } else if (error.request) {
+      logger.error(colors.error + `Failed to get user info: No response received (${error.code}) - Check your network connection` + colors.reset);
+    } else {
+      logger.error(colors.error + `Failed to get user info: ${error.message}` + colors.reset);
     }
+    return null;
   }
 }
 
-/* ==========================
-   13) getAccountDetails (3 attempts)
-   ========================== */
-async function getAccountDetails(token, index, retries = 3, delayMs = 43200000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const agent = buildProxyAgent(index);
-      const [resp1, resp2, resp3] = await handleAxios429(async () => {
-        return await Promise.all([
-          axios.get('https://rewardstn.openledger.xyz/api/v1/reward_realtime', {
-            headers: { Authorization: `Bearer ${token}` },
-            httpsAgent: agent
-          }),
-          axios.get('https://rewardstn.openledger.xyz/api/v1/reward_history', {
-            headers: { Authorization: `Bearer ${token}` },
-            httpsAgent: agent
-          }),
-          axios.get('https://rewardstn.openledger.xyz/api/v1/reward', {
-            headers: { Authorization: `Bearer ${token}` },
-            httpsAgent: agent
-          })
-        ]);
-      });
-
-      const totalHeartbeats = parseInt(resp1.data.data[0].total_heartbeats, 10);
-      const totalPointsHist = parseInt(resp2.data.data[0].total_points, 10);
-      const totalPointFromReward = parseFloat(resp3.data.data.totalPoint);
-      const epochName = resp3.data.data.name;
-      const total = totalHeartbeats + totalPointFromReward;
-
-      logSuccess(`[${index + 1}] => AID=${accountIDs[token]}, HB=${totalHeartbeats}, Points=${total.toFixed(2)} (Epoch=${epochName}), Proxy=${proxies[index]}`);
-      return;
-    } catch (err) {
-      logError(`[${index + 1}] => getAccountDetails attempt ${attempt}: ${err.message}`);
-      if (attempt < retries) {
-        logInfo(`[${index + 1}] => Retry in ${delayMs/1000}s...`);
-        await new Promise(r => setTimeout(r, delayMs));
-      } else {
-        logError(`[${index + 1}] => All attempts failed for getAccountDetails.`);
-      }
+async function getClaimDetails(token) {
+  try {
+    const authToken = token.startsWith("Bearer") ? token : `Bearer ${token}`;
+    const response = await axios.get(`${REWARDS_URL}/ext/api/v2/claim_details`, {
+      headers: { ...HEADERS, Authorization: authToken },
+      timeout: 30000,
+      family: 4
+    });
+    printDivider();
+    logger.info(colors.info + "[CLAIM DETAILS]" + colors.reset);
+    logger.info(`${colors.info}▸ Tier       : ${colors.green}${response.data.data.tier}${colors.reset}`);
+    logger.info(`${colors.info}▸ Daily Point : ${colors.green}${response.data.data.dailyPoint}${colors.reset}`);
+    const status = response.data.data.claimed
+      ? colors.warning + "Claimed" + colors.reset
+      : colors.green + "Available" + colors.reset;
+    logger.info(`${colors.info}▸ Status     : ${status}`);
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      logger.error(colors.error + `Failed to get claim details: ${error.response.status} - ${JSON.stringify(error.response.data)}` + colors.reset);
+    } else if (error.request) {
+      logger.error(colors.error + `Failed to get claim details: No response received (${error.code}) - Check your network connection` + colors.reset);
+    } else {
+      logger.error(colors.error + `Failed to get claim details: ${error.message}` + colors.reset);
     }
+    return null;
   }
 }
 
-/* ==========================
-   14) checkAndClaimReward (3 attempts)
-   ========================== */
-async function checkAndClaimReward(token, index, retries = 3, delayMs = 43200000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const agent = buildProxyAgent(index);
-      const details = await handleAxios429(() => {
-        return axios.get('https://rewardstn.openledger.xyz/api/v1/claim_details', {
-          headers: { Authorization: `Bearer ${token}` },
-          httpsAgent: agent
-        });
-      });
-      if (!details.data.data.claimed) {
-        const claim = await handleAxios429(() => {
-          return axios.get('https://rewardstn.openledger.xyz/api/v1/claim_reward', {
-            headers: { Authorization: `Bearer ${token}` },
-            httpsAgent: agent
-          });
-        });
-        if (claim.data.status === 'SUCCESS') {
-          logSuccess(`[${index + 1}] => Claimed daily reward for AID=${accountIDs[token]}`);
-        }
-      }
-      return;
-    } catch (err) {
-      logError(`[${index + 1}] => checkAndClaim attempt ${attempt}: ${err.message}`);
-      if (attempt < retries) {
-        logInfo(`[${index + 1}] => Retry in ${delayMs/1000}s...`);
-        await new Promise(r => setTimeout(r, delayMs));
-      } else {
-        logError(`[${index + 1}] => All attempts failed for checkAndClaimReward.`);
-      }
+async function getStreakInfo(token) {
+  try {
+    const authToken = token.startsWith("Bearer") ? token : `Bearer ${token}`;
+    const response = await axios.get(`${REWARDS_URL}/ext/api/v2/streak`, {
+      headers: { ...HEADERS, Authorization: authToken },
+      timeout: 30000,
+      family: 4
+    });
+    printDivider();
+    logger.info(colors.info + "[STREAK INFO]" + colors.reset);
+    const claimedDays = response.data.data.filter(day => day.isClaimed).length;
+    logger.info(`${colors.info}▸ Current    : ${colors.green}${claimedDays} days${colors.reset}`);
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      logger.error(colors.error + `Failed to get streak info: ${error.response.status} - ${JSON.stringify(error.response.data)}` + colors.reset);
+    } else if (error.request) {
+      logger.error(colors.error + `Failed to get streak info: No response received (${error.code}) - Check your network connection` + colors.reset);
+    } else {
+      logger.error(colors.error + `Failed to get streak info: ${error.message}` + colors.reset);
     }
+    return null;
+  }
+}
+
+async function claimReward(token, index) {
+  try {
+    const authToken = token.startsWith("Bearer") ? token : `Bearer ${token}`;
+    logger.info(colors.info + `[${index + 1}] => Attempting to claim reward...` + colors.reset);
+    const response = await axios.get(`${REWARDS_URL}/ext/api/v2/claim_reward`, {
+      headers: { ...HEADERS, Authorization: authToken },
+      timeout: 30000,
+      family: 4
+    });
+    if (response.data.status === "SUCCESS") {
+      printDivider();
+      logger.success(colors.green + `[${index + 1}] => [CLAIM SUCCESS] Daily reward claimed successfully!` + colors.reset);
+      logger.info(`${colors.info}[${index + 1}] => Next Claim at: ${colors.green}${formatTime(response.data.data.nextClaim)}${colors.reset}`);
+    } else {
+      logger.warn(colors.warning + `[${index + 1}] => Claim reward response: ${JSON.stringify(response.data)}` + colors.reset);
+    }
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      logger.error(colors.error + `[${index + 1}] => Failed to claim reward: ${error.response.status} - ${JSON.stringify(error.response.data)}` + colors.reset);
+    } else if (error.request) {
+      logger.error(colors.error + `[${index + 1}] => Failed to claim reward: No response received (${error.code}) - Check your network connection` + colors.reset);
+    } else {
+      logger.error(colors.error + `[${index + 1}] => Failed to claim reward: ${error.message}` + colors.reset);
+    }
+    return null;
   }
 }
 
 /* ==========================
-   15) The concurrency pipeline
+   9) Heartbeat Function
+   Sends a POST to /ext/api/v2/nodes/communicate with a browser‑like Host.
    ========================== */
-async function runPipeline({ ownerAddress, token, workerID, sessionID }, index) {
-  // get ID
-  await getAccountID(token, index);
-  // get details
-  await getAccountDetails(token, index);
-  // claim
-  await checkAndClaimReward(token, index);
-  // connect WS
-  connectWebSocket({ ownerAddress, token, workerID, sessionID }, index);
-}
-
-/* ==========================
-   16) Connect WebSocket with proxy
-   - ws v8+ supports { agent: HttpsProxyAgent(...) }
-   - Avoid duplicate reconnect
-   ========================== */
-function connectWebSocket({ ownerAddress, token, workerID, sessionID }, index) {
-  let reconnectPending = false;
-  const proxyUrl = useProxy ? proxies[index] : null;
-
-  // Build an agent for WebSocket:
-  let wsAgent;
-  if (proxyUrl) {
-    wsAgent = new HttpsProxyAgent(proxyUrl, { rejectUnauthorized: false });
-  } else {
-    wsAgent = new https.Agent({ rejectUnauthorized: false });
-  }
-
-  const wsUrl = `wss://apitn.openledger.xyz/ws/v1/orch?authToken=${token}`;
-  const wsOptions = {
-    agent: wsAgent,            // <-- Proxy the wss connection 
-    rejectUnauthorized: false, // if ignoring cert checks
-  };
-  const ws = new WebSocket(wsUrl, wsOptions);
-
-  let heartbeatInterval;
-
-  function sendHeartbeat() {
+async function sendHeartbeat(token, workerID, ownerAddress, sessionID, index) {
+  try {
+    const authToken = token.startsWith("Bearer") ? token : `Bearer ${token}`;
     const { gpu, storage } = getOrAssignResources(workerID);
-    const hbMsg = {
-      msgType: 'HEARTBEAT',
-      workerType: 'LWEXT',
-      workerID,
+    const heartbeatMessage = {
       message: {
         Worker: {
           Identity: workerID,
           ownerAddress,
-          type: 'LWEXT',
-          Host: 'chrome-extension://ekbbplmjjgoobhdlffmgeokalelnmjjc'
+          type: "LWEXT",
+          Host: "chrome-extension://ekbbplmjjgoobhdlffmgeokalelnmjjc",
+          pending_jobs_count: 0
         },
         Capacity: {
-          AvailableMemory: (Math.random() * 32).toFixed(2),
+          AvailableMemory: parseFloat((Math.random() * 32).toFixed(2)),
           AvailableStorage: storage,
           AvailableGPU: gpu,
           AvailableModels: []
         }
-      }
+      },
+      msgType: "HEARTBEAT",
+      workerType: "LWEXT",
+      workerID: workerID
     };
-    logInfo(`[${index + 1}] => HEARTBEAT: workerID=${workerID}, AID=${accountIDs[token]}, Proxy=${proxyUrl}`);
-    ws.send(JSON.stringify(hbMsg));
-  }
 
-  function doReconnect() {
-    if (reconnectPending) return;
-    reconnectPending = true;
-    logWarn(`[${index + 1}] => Reconnect WS for workerID=${workerID} in 30s...`);
-    setTimeout(() => {
-      reconnectPending = false;
-      connectWebSocket({ ownerAddress, token, workerID, sessionID }, index);
-    }, 30000);
-  }
-
-  ws.on('open', () => {
-    logSuccess(`[${index + 1}] => WS open => workerID=${workerID}, AID=${accountIDs[token]}, Proxy=${proxyUrl}`);
-    // REGISTER
-    const regMsg = {
-      workerID,
-      msgType: 'REGISTER',
-      workerType: 'LWEXT',
-      message: {
-        id: sessionID,
-        type: 'REGISTER',
-        worker: {
-          host: 'chrome-extension://ekbbplmjjgoobhdlffmgeokalelnmjjc',
-          identity: workerID,
-          ownerAddress,
-          type: 'LWEXT'
-        }
+    logger.info(colors.info + `[${index + 1}] => Sending HEARTBEAT for workerID=${workerID}` + colors.reset);
+    const response = await axios.post(
+      `${BASE_URL}/ext/api/v2/nodes/communicate`,
+      heartbeatMessage,
+      {
+        headers: { ...HEADERS, Authorization: authToken },
+        timeout: 30000,
+        family: 4
       }
-    };
-    ws.send(JSON.stringify(regMsg));
-
-    heartbeatInterval = setInterval(sendHeartbeat, 30000);
-  });
-
-  ws.on('message', (data) => {
-    logInfo(`[${index + 1}] => WS message => workerID=${workerID}: ${data}`);
-  });
-
-  ws.on('error', (err) => {
-    logError(`[${index + 1}] => WS error => workerID=${workerID}: ${err.message || err}`);
-  });
-
-  ws.on('close', () => {
-    logWarn(`[${index + 1}] => WS closed => workerID=${workerID}, AID=${accountIDs[token]}`);
-    clearInterval(heartbeatInterval);
-    doReconnect();
-  });
+    );
+    // Use default of 180 seconds if next_heartbeat is undefined.
+    const nextHeartbeat = (response.data && response.data.data && response.data.data.next_heartbeat) || 180;
+    logger.success(colors.green + `[${index + 1}] => Heartbeat successful. Next heartbeat in ${nextHeartbeat} seconds.` + colors.reset);
+  } catch (error) {
+    logger.error(colors.error + `[${index + 1}] => Error sending heartbeat: ${error.response?.data || error.message}` + colors.reset);
+  }
 }
 
 /* ==========================
-   17) Periodic claim (12h)
+   10) Concurrency Pipeline
+   For each token, perform API checks, heartbeat, and claim reward.
    ========================== */
-function schedulePeriodicClaims() {
-  // initial
-  Promise.all(tokens.map((tk, i) => checkAndClaimReward(tk.token, i)))
-    .catch(err => logError(`Error in initial claim: ${err.message}`));
+async function runPipeline({ ownerAddress, token, workerID, sessionID }, index) {
+  await checkAppVersion(token);
+  await getUserInfo(token);
+  await getClaimDetails(token);
+  await getStreakInfo(token);
+  await sendHeartbeat(token, workerID, ownerAddress, sessionID, index);
+  await claimReward(token, index);
+}
 
-  // every 12h
+/* ==========================
+   11) Scheduling
+   - Heartbeats: every 30 seconds.
+   - Claims: every 12 hours.
+   ========================== */
+function scheduleHeartbeats() {
   setInterval(() => {
-    Promise.all(tokens.map((tk, i) => checkAndClaimReward(tk.token, i)))
-      .catch(err => logError(`Error in scheduled claims: ${err.message}`));
+    tokens.forEach((t, i) => {
+      sendHeartbeat(t.token, t.workerID, t.ownerAddress, t.sessionID, i);
+    });
+  }, 30000);
+}
+
+function scheduleClaims() {
+  // Initial claim attempt
+  tokens.forEach((t, i) => {
+    claimReward(t.token, i);
+  });
+  // Every 12 hours
+  setInterval(() => {
+    tokens.forEach((t, i) => {
+      claimReward(t.token, i);
+    });
   }, 12 * 60 * 60 * 1000);
 }
 
 /* ==========================
-   18) Periodic updates (5m)
-   ========================== */
-function schedulePeriodicUpdates() {
-  setInterval(async () => {
-    try {
-      await Promise.all(tokens.map(({ token }, i) => getAccountDetails(token, i)));
-    } catch (err) {
-      logError(`Error in scheduled details: ${err.message}`);
-    }
-  }, 5 * 60 * 1000);
-}
-
-/* ==========================
-   MAIN
+   12) MAIN
    ========================== */
 (async () => {
-  displayHeader();
+  printDivider();
+  logger.info(colors.info + "OpenLedger Bot by LazyNode" + colors.reset);
+  printDivider();
 
-  // Periodic claiming
-  schedulePeriodicClaims();
-
-  // Run concurrency pipeline for all tokens
+  // Run the pipeline for all tokens
   await Promise.all(tokens.map((t, i) => runPipeline(t, i)));
 
-  // Periodic details
-  schedulePeriodicUpdates();
+  // Schedule periodic tasks
+  scheduleHeartbeats();
+  scheduleClaims();
 })();
